@@ -2,8 +2,9 @@ from __future__ import unicode_literals
 from contextlib import contextmanager
 import functools
 import logging
-import time
 import os
+import random
+import time
 
 try:
     from warcio.capture_http import capture_http
@@ -12,6 +13,7 @@ except ImportError as e:
     warcio_failed = e
 
 import requests  # Must be imported after capture_http
+from requests.exceptions import Timeout, ConnectionError, HTTPError
 
 VERIFY_HTTPS = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'yahoogroups_cert_chain.pem')
 
@@ -19,6 +21,26 @@ VERIFY_HTTPS = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'yahoogr
 @contextmanager
 def dummy_contextmanager(*kargs, **kwargs):
     yield
+
+
+class YGAException(Exception):
+    pass
+
+class Unrecoverable(YGAException):
+    pass
+
+class AuthenticationError(Unrecoverable):
+    pass
+
+class NotFound(Unrecoverable):
+    pass
+
+class Recoverable(YGAException):
+    pass
+
+
+def backoff_time(attempt):
+    return random.randint(2**(attempt), 2**(attempt+1))
 
 
 class YahooGroupsAPI:
@@ -101,13 +123,41 @@ class YahooGroupsAPI:
 
             uri = "/".join(uri_parts)
             time.sleep(self.delay)
-            r = self.s.get(uri, params=opts, verify=VERIFY_HTTPS, allow_redirects=False, timeout=15)
-            try:
-                r.raise_for_status()
-                if r.status_code != 200:
-                    raise requests.exceptions.HTTPError(response=r)
-                return r.json()['ygData']
-            except Exception as e:
-                self.logger.debug("Exception raised on uri: %s", r.request.url)
-                self.logger.debug(r.content)
-                raise e
+
+            tries = 5  # FIXME, customisable
+            for attempt in range(tries):
+                try:
+                    try:
+                        r = self.s.get(uri, params=opts, verify=VERIFY_HTTPS, allow_redirects=False, timeout=15)
+                        r.raise_for_status()
+                        # raise_for_status won't raise on 307s
+                        if r.status_code != 200:
+                            raise requests.exceptions.HTTPError(response=r)
+                        return r.json()['ygData']
+                    except (ConnectionError, Timeout) as e:
+                        self.logger.warning("Network error, attempt %d/%d, %s", attempt, tries, uri, e)
+                        self.logger.debug("Exception detail:", exc_info=e)
+                        raise Recoverable
+                    except HTTPError as e:
+                        ygError = {}
+                        try:
+                            ygError = e.response.json()['ygError']
+                        except (ValueError, KeyError):
+                            pass
+
+                        code = e.response.status_code
+                        if code == 307 or code == 401 or code == 403:
+                            raise AuthenticationError
+                        elif code == 404:
+                            raise NotFound
+                        else:
+                            # TODO: Test ygError response?
+                            raise Recoverable
+                except Recoverable:
+                    if attempt < tries - 1:
+                        delay = backoff_time(i)
+                        # TODO: some info logging here
+                        time.sleep(delay)
+                        continue
+                    else:
+                        raise
